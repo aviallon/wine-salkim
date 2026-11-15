@@ -218,6 +218,10 @@ static const WCHAR *service_type_string( DWORD type )
         case SERVICE_WIN32_OWN_PROCESS: return L"WIN32_OWN_PROCESS";
         case SERVICE_WIN32_SHARE_PROCESS: return L"WIN32_SHARE_PROCESS";
         case SERVICE_WIN32: return L"WIN32";
+        case SERVICE_KERNEL_DRIVER: return L"KERNEL_DRIVER";
+        case SERVICE_FILE_SYSTEM_DRIVER: return L"FILE_SYSTEM_DRIVER";
+        case SERVICE_RECOGNIZER_DRIVER: return L"RECOGNIZER_DRIVER";
+        case SERVICE_ADAPTER: return L"ADAPTER";
         default: return L"";
     }
 }
@@ -231,33 +235,44 @@ static const WCHAR *service_state_string( DWORD state )
     return L"";
 }
 
-static DWORD query_service( SC_HANDLE manager, const WCHAR *name )
+static void print_service_status( const WCHAR *name, const SERVICE_STATUS_PROCESS *status,
+                                  BOOL extended )
+{
+    printf( "SERVICE_NAME: %ls\n"
+            "        TYPE               : %lx  %ls\n"
+            "        STATE              : %lx  %ls\n"
+            "        WIN32_EXIT_CODE    : %lu  (0x%lx)\n"
+            "        SERVICE_EXIT_CODE  : %lu  (0x%lx)\n"
+            "        CHECKPOINT         : 0x%lx\n"
+            "        WAIT_HINT          : 0x%lx\n",
+            name, status->dwServiceType, service_type_string( status->dwServiceType ),
+            status->dwCurrentState, service_state_string( status->dwCurrentState ),
+            status->dwWin32ExitCode, status->dwWin32ExitCode,
+            status->dwServiceSpecificExitCode, status->dwServiceSpecificExitCode,
+            status->dwCheckPoint, status->dwWaitHint );
+    if (extended)
+        printf( "        PID                : %lu\n"
+                "        FLAGS              : %lu\n",
+                status->dwProcessId, status->dwServiceFlags );
+}
+
+static DWORD query_service( SC_HANDLE manager, const WCHAR *name, BOOL extended )
 {
     SC_HANDLE service;
-    SERVICE_STATUS status;
-    DWORD ret = ERROR_SUCCESS;
+    SERVICE_STATUS_PROCESS status;
+    DWORD ret = ERROR_SUCCESS, size;
 
     service = OpenServiceW( manager, name, SERVICE_QUERY_STATUS );
     if (service)
     {
-        if (!QueryServiceStatus( service, &status ))
+        if (!QueryServiceStatusEx( service, SC_STATUS_PROCESS_INFO, (BYTE *)&status,
+                                   sizeof(status), &size ))
         {
             ret = GetLastError();
             WINE_ERR("failed to query service status %lu\n", ret);
         }
         else
-            printf( "SERVICE_NAME: %ls\n"
-                    "        TYPE               : %lx  %ls\n"
-                    "        STATE              : %lx  %ls\n"
-                    "        WIN32_EXIT_CODE    : %lu  (0x%lx)\n"
-                    "        SERVICE_EXIT_CODE  : %lu  (0x%lx)\n"
-                    "        CHECKPOINT         : 0x%lx\n"
-                    "        WAIT_HINT          : 0x%lx\n",
-                    name, status.dwServiceType, service_type_string( status.dwServiceType ),
-                    status.dwCurrentState, service_state_string( status.dwCurrentState ),
-                    status.dwWin32ExitCode, status.dwWin32ExitCode,
-                    status.dwServiceSpecificExitCode, status.dwServiceSpecificExitCode,
-                    status.dwCheckPoint, status.dwWaitHint );
+            print_service_status( name, &status, extended );
         CloseServiceHandle( service );
     }
     else
@@ -269,15 +284,101 @@ static DWORD query_service( SC_HANDLE manager, const WCHAR *name )
     return ret;
 }
 
+static DWORD parse_type( const WCHAR *str )
+{
+    if (!wcsicmp( str, L"all" )) return SERVICE_WIN32 | SERVICE_DRIVER;
+    if (!wcsicmp( str, L"driver" )) return SERVICE_DRIVER;
+    if (!wcsicmp( str, L"kernel" )) return SERVICE_KERNEL_DRIVER;
+    if (!wcsicmp( str, L"filesys" )) return SERVICE_FILE_SYSTEM_DRIVER;
+    if (!wcsicmp( str, L"rec" ) || !wcsicmp( str, L"recognizer" ))
+        return SERVICE_RECOGNIZER_DRIVER;
+    if (!wcsicmp( str, L"interact" )) return SERVICE_INTERACTIVE_PROCESS;
+    if (!wcsicmp( str, L"own" )) return SERVICE_WIN32_OWN_PROCESS;
+    if (!wcsicmp( str, L"share" )) return SERVICE_WIN32_SHARE_PROCESS;
+    return 0;  /* unknown */
+}
+
+static DWORD parse_state( const WCHAR *str )
+{
+    if (!wcsicmp( str, L"active" )) return SERVICE_ACTIVE;
+    if (!wcsicmp( str, L"inactive" )) return SERVICE_INACTIVE;
+    return SERVICE_STATE_ALL;
+}
+
+/* 'sc query' and 'sc queryex' without a service name list every service. */
+static DWORD enum_services( SC_HANDLE manager, DWORD type, DWORD state, BOOL extended )
+{
+    ENUM_SERVICE_STATUS_PROCESSW *info;
+    DWORD size = 0x4000, needed = 0, count = 0, resume = 0, ret;
+    unsigned int i;
+
+    for (;;)
+    {
+        if (!(info = malloc( size ))) return ERROR_NOT_ENOUGH_MEMORY;
+        /* Restart the enumeration each time: ERROR_MORE_DATA advances the resume
+         * handle past what already fits, so reusing it would drop the services
+         * that were read into the buffer we just freed. */
+        resume = 0;
+        if (EnumServicesStatusExW( manager, SC_ENUM_PROCESS_INFO, type, state, (BYTE *)info, size,
+                                   &needed, &count, &resume, NULL ))
+            break;
+        ret = GetLastError();
+        free( info );
+        if (ret != ERROR_MORE_DATA) return ret;
+        size = needed > size ? needed : size * 2;
+    }
+
+    for (i = 0; i < count; i++)
+    {
+        if (i) printf( "\n" );
+        print_service_status( info[i].lpServiceName, &info[i].ServiceStatusProcess, extended );
+    }
+
+    free( info );
+    return ERROR_SUCCESS;
+}
+
+static DWORD query_services( SC_HANDLE manager, int argc, const WCHAR *argv[], BOOL extended )
+{
+    const WCHAR *name = NULL, *str;
+    DWORD type = SERVICE_WIN32 | SERVICE_DRIVER, state = SERVICE_STATE_ALL;
+    unsigned int i;
+
+#define PARSE(x, y) parse_string_param( (argc), (argv), &(i), (x), ARRAY_SIZE(x) - 1, (y) )
+    for (i = 0; i < argc; i++)
+    {
+        if (PARSE( L"type=", &str ))
+        {
+            if (!(type = parse_type( str )))
+            {
+                WINE_ERR("invalid service type %s\n", debugstr_w( str ));
+                return ERROR_INVALID_PARAMETER;
+            }
+            continue;
+        }
+        if (PARSE( L"state=", &str )) { state = parse_state( str ); continue; }
+        if (PARSE( L"bufsize=", &str )) continue;
+        if (PARSE( L"ri=", &str )) continue;
+        if (PARSE( L"res=", &str )) { WINE_FIXME("res argument not supported\n"); continue; }
+        if (PARSE( L"group=", &str )) { WINE_FIXME("group argument not supported\n"); continue; }
+        if (!name) { name = argv[i]; continue; }
+        WINE_FIXME("unexpected argument %s\n", debugstr_w( argv[i] ));
+    }
+#undef PARSE
+
+    if (name) return query_service( manager, name, extended );
+    return enum_services( manager, type, state, extended );
+}
+
 int __cdecl wmain( int argc, const WCHAR *argv[] )
 {
     SC_HANDLE manager, service;
     SERVICE_STATUS status;
     DWORD ret = ERROR_SUCCESS;
 
-    if (argc < 3) usage();
+    if (argc < 2) usage();
 
-    if (argv[2][0] == '\\' && argv[2][1] == '\\')
+    if (argc > 2 && argv[2][0] == '\\' && argv[2][1] == '\\')
     {
         WINE_FIXME("server argument not supported\n");
         return ERROR_INVALID_COMMAND_LINE;
@@ -289,6 +390,12 @@ int __cdecl wmain( int argc, const WCHAR *argv[] )
         ret = GetLastError();
         WINE_ERR("failed to open service manager: %lu\n", ret);
         return ret;
+    }
+
+    if (argc < 3 && wcsicmp( argv[1], L"query" ) && wcsicmp( argv[1], L"queryex" ))
+    {
+        CloseServiceHandle( manager );
+        usage();
     }
 
     if (!wcsicmp( argv[1], L"create" ))
@@ -394,7 +501,7 @@ int __cdecl wmain( int argc, const WCHAR *argv[] )
                 WINE_ERR("failed to start service %lu\n", ret);
             }
             else
-                ret = query_service( manager, argv[2] );
+                ret = query_service( manager, argv[2], FALSE );
             CloseServiceHandle( service );
         }
         else
@@ -414,7 +521,7 @@ int __cdecl wmain( int argc, const WCHAR *argv[] )
                 WINE_ERR("failed to stop service %lu\n", ret);
             }
             else
-                ret = query_service( manager, argv[2] );
+                ret = query_service( manager, argv[2], FALSE );
             CloseServiceHandle( service );
         }
         else
@@ -425,7 +532,11 @@ int __cdecl wmain( int argc, const WCHAR *argv[] )
     }
     else if (!wcsicmp( argv[1], L"query" ))
     {
-        ret = query_service( manager, argv[2] );
+        ret = query_services( manager, argc - 2, argv + 2, FALSE );
+    }
+    else if (!wcsicmp( argv[1], L"queryex" ))
+    {
+        ret = query_services( manager, argc - 2, argv + 2, TRUE );
     }
     else if (!wcsicmp( argv[1], L"sdset" ))
     {

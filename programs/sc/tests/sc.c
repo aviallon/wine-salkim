@@ -70,6 +70,55 @@ static BOOL run_sc_exe_(const char *file, unsigned line, const char *cmd, DWORD 
     return bret;
 }
 
+/* Variant that captures what "sc" printed, for the commands whose behaviour is
+ * visible in the output rather than in the exit code. */
+#define run_sc_exe_output(c,r,b,z) run_sc_exe_output_(__FILE__,__LINE__,c,r,b,z)
+static BOOL run_sc_exe_output_(const char *file, unsigned line, const char *cmd, DWORD *rc,
+                               char *buffer, DWORD size)
+{
+    STARTUPINFOA si = {sizeof(STARTUPINFOA)};
+    SECURITY_ATTRIBUTES secattr = {sizeof(SECURITY_ATTRIBUTES), NULL, TRUE};
+    PROCESS_INFORMATION pi;
+    HANDLE read_pipe, write_pipe;
+    char cmdline[256];
+    DWORD ret, read, total = 0;
+    BOOL bret;
+
+    buffer[0] = 0;
+    if (!CreatePipe(&read_pipe, &write_pipe, &secattr, 0))
+        return FALSE;
+
+    si.dwFlags = STARTF_USESTDHANDLES;
+    si.hStdInput  = nul_file;
+    si.hStdOutput = write_pipe;
+    si.hStdError  = write_pipe;
+
+    strcpy(cmdline, cmd);
+    if (!CreateProcessA(NULL, cmdline, NULL, NULL, TRUE, 0, NULL, NULL, &si, &pi))
+    {
+        CloseHandle(read_pipe);
+        CloseHandle(write_pipe);
+        return FALSE;
+    }
+    CloseHandle(write_pipe);
+
+    while (total + 1 < size && ReadFile(read_pipe, buffer + total, size - 1 - total, &read, NULL) && read)
+        total += read;
+    buffer[total] = 0;
+    CloseHandle(read_pipe);
+
+    ret = WaitForSingleObject(pi.hProcess, 10000);
+    if (ret == WAIT_TIMEOUT)
+        TerminateProcess(pi.hProcess, 1);
+
+    bret = GetExitCodeProcess(pi.hProcess, rc);
+    ok_(file, line)(bret, "GetExitCodeProcess failed: %ld\n", GetLastError());
+
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
+    return bret;
+}
+
 #define BROKEN_CREATE               0x000000001UL
 #define BROKEN_BINPATH              0x000000002UL
 #define BROKEN_TYPE                 0x000000004UL
@@ -388,6 +437,50 @@ static int running_elevated(void)
 }
 
 
+static void test_queryex(BOOL elevated)
+{
+    char output[8192];
+    DWORD r;
+
+    /* "queryex" reports the extended status: PID and FLAGS are what distinguishes
+     * it from "query", and both are printed for a service that exists. */
+    if (!elevated)
+    {
+        win_skip("\"sc queryex\" tests need elevated permissions\n");
+        return;
+    }
+
+    run_sc_exe("sc create " TEST_SERVICE_NAME " binpath= \"" TEST_SERVICE_BINARY "\"", &r);
+    ok(r == SC_EXIT_SUCCESS, "got exit code %ld, expected %d\n", r, SC_EXIT_SUCCESS);
+
+    run_sc_exe_output("sc queryex " TEST_SERVICE_NAME, &r, output, sizeof(output));
+    ok(r == SC_EXIT_SUCCESS, "got exit code %ld, expected %d\n", r, SC_EXIT_SUCCESS);
+    ok(strstr(output, "SERVICE_NAME: " TEST_SERVICE_NAME) != NULL, "service name missing from output\n");
+    ok(strstr(output, "PID") != NULL, "PID missing from extended output\n");
+    ok(strstr(output, "FLAGS") != NULL, "FLAGS missing from extended output\n");
+
+    /* and, unlike queryex, plain "query" does not print them */
+    run_sc_exe_output("sc query " TEST_SERVICE_NAME, &r, output, sizeof(output));
+    ok(r == SC_EXIT_SUCCESS, "got exit code %ld, expected %d\n", r, SC_EXIT_SUCCESS);
+    ok(strstr(output, "PID") == NULL, "PID printed by query\n");
+    ok(strstr(output, "FLAGS") == NULL, "FLAGS printed by query\n");
+
+    run_sc_exe("sc queryex " TEST_SERVICE_NAME "_does_not_exist", &r);
+    ok(r == SC_EXIT_SERVICE_DOES_NOT_EXIST, "got exit code %ld, expected %d\n",
+       r, SC_EXIT_SERVICE_DOES_NOT_EXIST);
+
+    /* A nameless "queryex" is what applications use to look for a service of
+     * theirs (Settlers United greps it for its WireGuardTunnel$ entry). Only the
+     * shape of the output is checked: whether Windows accepts the nameless form
+     * is not documented, so a rejection is not treated as a failure. */
+    if (run_sc_exe_output("sc queryex", &r, output, sizeof(output)) && r == SC_EXIT_SUCCESS)
+        ok(strstr(output, "SERVICE_NAME:") != NULL, "no service listed by a nameless queryex\n");
+    else
+        skip("a nameless \"sc queryex\" is not supported here\n");
+
+    delete_service(TEST_SERVICE_NAME, SC_EXIT_SUCCESS, FALSE);
+}
+
 START_TEST(sc)
 {
     SECURITY_ATTRIBUTES secattr = {sizeof(SECURITY_ATTRIBUTES), NULL, TRUE};
@@ -400,6 +493,7 @@ START_TEST(sc)
     ok(!!scmgr, "OpenSCManagerA failed: %ld\n", GetLastError());
 
     test_create_service(elevated);
+    test_queryex(elevated);
 
     CloseServiceHandle(scmgr);
     CloseHandle(nul_file);
